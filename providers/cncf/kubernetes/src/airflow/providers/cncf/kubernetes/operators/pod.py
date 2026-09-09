@@ -922,8 +922,11 @@ class KubernetesPodOperator(BaseOperator):
                     container_name_log_prefix_enabled=self.container_name_log_prefix_enabled,
                     log_formatter=self.log_formatter,
                 )
+            followed_containers = (
+                [self.container_logs] if isinstance(self.container_logs, str) else self.container_logs
+            )
             if not self.get_logs or (
-                self.container_logs is not True and self.base_container_name not in self.container_logs
+                followed_containers is not True and self.base_container_name not in followed_containers
             ):
                 self.pod_manager.await_container_completion(
                     pod=pod,
@@ -1052,6 +1055,7 @@ class KubernetesPodOperator(BaseOperator):
             in_cluster=self.in_cluster,
             poll_interval=self.poll_interval,
             get_logs=self.get_logs,
+            init_container_logs=self.init_container_logs,
             startup_timeout=self.startup_timeout_seconds,
             startup_check_interval=self.startup_check_interval_seconds,
             schedule_timeout=self.schedule_timeout_seconds,
