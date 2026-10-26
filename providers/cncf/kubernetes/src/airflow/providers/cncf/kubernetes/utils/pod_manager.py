@@ -66,6 +66,7 @@ if TYPE_CHECKING:
     from kubernetes.client.models.v1_pod_condition import V1PodCondition
     from urllib3.response import HTTPResponse
 
+    from airflow._shared.logging.types import Logger
     from airflow.providers.cncf.kubernetes.hooks.kubernetes import AsyncKubernetesHook
 
 
@@ -126,6 +127,56 @@ class PodPhase:
 
 def check_exception_is_kubernetes_api_unauthorized(exc: BaseException):
     return isinstance(exc, ApiException) and exc.status and str(exc.status) == "401"
+
+
+def reconcile_requested_log_containers(
+    log: Logger, requested: Iterable[str] | str | bool | None, actual: list[str], pod_name
+) -> list[str]:
+    """
+    Return actual containers based on requested.
+
+    Shared by :class:`PodManager` and :class:`AsyncPodManager` so both the sync and
+    deferrable execution paths resolve requested container names identically.
+
+    :meta private:
+    """
+    containers_to_log = []
+    if actual:
+        if isinstance(requested, str):
+            # fetch logs only for requested container if only one container is provided
+            if requested in actual:
+                containers_to_log.append(requested)
+            else:
+                log.error(
+                    "container %s whose logs were requested not found in the pod %s",
+                    requested,
+                    pod_name,
+                )
+        elif isinstance(requested, bool):
+            # if True is provided, get logs for all the containers
+            if requested is True:
+                containers_to_log.extend(actual)
+            else:
+                log.error(
+                    "False is not a valid value for container_logs",
+                )
+        else:
+            # if a sequence of containers are provided, iterate for every container in the pod
+            if isinstance(requested, Iterable):
+                for container in requested:
+                    if container in actual:
+                        containers_to_log.append(container)
+                    else:
+                        log.error(
+                            "Container %s whose logs were requests not found in the pod %s",
+                            container,
+                            pod_name,
+                        )
+            else:
+                log.error("Invalid type %s specified for container names input parameter", type(requested))
+    else:
+        log.error("Could not retrieve containers for the pod: %s", pod_name)
+    return containers_to_log
 
 
 def log_pod_event(
@@ -444,16 +495,25 @@ class PodManager(LoggingMixin):
         return self.run_pod_async(pod)
 
     async def watch_pod_events(self, pod: V1Pod, check_interval: float = 10) -> None:
-        """Read pod events and write into log."""
+        """
+        Read pod events and write into log.
+
+        Best-effort: any error logs one warning and stops the watch, so a struggling API server
+        is not polled again for this pod.
+        """
         resource_version = None
         seen_events: set[str] = set()
         while not self.stop_watching_events:
-            events = self.read_pod_events(pod, resource_version)
-            if events.metadata and events.metadata.resource_version:
-                resource_version = events.metadata.resource_version
-            for event in events.items:
-                log_pod_event(self, event, seen_events)
-                resource_version = event.metadata.resource_version
+            try:
+                events = self.read_pod_events(pod, resource_version)
+                if events.metadata and events.metadata.resource_version:
+                    resource_version = events.metadata.resource_version
+                for event in events.items:
+                    log_pod_event(self, event, seen_events)
+                    resource_version = event.metadata.resource_version
+            except Exception as e:
+                self.log.warning("Stopped watching events of pod %s: %s", pod.metadata.name, e, exc_info=True)
+                return
             await asyncio.sleep(check_interval)
 
     async def await_pod_start(
@@ -672,45 +732,7 @@ class PodManager(LoggingMixin):
         self, requested: Iterable[str] | str | bool | None, actual: list[str], pod_name
     ) -> list[str]:
         """Return actual containers based on requested."""
-        containers_to_log = []
-        if actual:
-            if isinstance(requested, str):
-                # fetch logs only for requested container if only one container is provided
-                if requested in actual:
-                    containers_to_log.append(requested)
-                else:
-                    self.log.error(
-                        "container %s whose logs were requested not found in the pod %s",
-                        requested,
-                        pod_name,
-                    )
-            elif isinstance(requested, bool):
-                # if True is provided, get logs for all the containers
-                if requested is True:
-                    containers_to_log.extend(actual)
-                else:
-                    self.log.error(
-                        "False is not a valid value for container_logs",
-                    )
-            else:
-                # if a sequence of containers are provided, iterate for every container in the pod
-                if isinstance(requested, Iterable):
-                    for container in requested:
-                        if container in actual:
-                            containers_to_log.append(container)
-                        else:
-                            self.log.error(
-                                "Container %s whose logs were requests not found in the pod %s",
-                                container,
-                                pod_name,
-                            )
-                else:
-                    self.log.error(
-                        "Invalid type %s specified for container names input parameter", type(requested)
-                    )
-        else:
-            self.log.error("Could not retrieve containers for the pod: %s", pod_name)
-        return containers_to_log
+        return reconcile_requested_log_containers(self.log, requested, actual, pod_name)
 
     def fetch_requested_init_container_logs(
         self,
@@ -974,8 +996,17 @@ class PodManager(LoggingMixin):
                 )
             time.sleep(1)
 
-    def extract_xcom(self, pod: V1Pod) -> str:
-        """Retrieve XCom value and kill xcom sidecar container."""
+    def extract_xcom(self, pod: V1Pod, *, ignore_kill_failure: bool = True) -> str:
+        """
+        Retrieve XCom value and kill xcom sidecar container.
+
+        :param pod: the pod to read the XCom result from.
+        :param ignore_kill_failure: when True (the default), a failure to kill the sidecar
+            container is logged as a warning and the successfully read XCom value is still
+            returned. Set it to False when the caller cannot tolerate a sidecar that keeps
+            running, for example ``KubernetesJobOperator``, whose Job can never reach a
+            terminal state while the sidecar is alive.
+        """
         # make sure that xcom sidecar container is still running
         if not self.container_is_running(pod, PodDefaults.SIDECAR_CONTAINER_NAME):
             raise XComRetrievalError(
@@ -986,7 +1017,16 @@ class PodManager(LoggingMixin):
             result = self.extract_xcom_json(pod)
             return result
         finally:
-            self.extract_xcom_kill(pod)
+            try:
+                self.extract_xcom_kill(pod)
+            except (PodCommandException, ApiException) as e:
+                if not ignore_kill_failure:
+                    raise
+                self.log.warning(
+                    "Failed to kill xcom sidecar container in pod %s, leaving it running: %s",
+                    pod.metadata.name,
+                    e,
+                )
 
     @generic_api_retry
     def extract_xcom_json(self, pod: V1Pod) -> str:
@@ -1174,19 +1214,28 @@ class AsyncPodManager(LoggingMixin):
         )
 
     async def watch_pod_events(self, pod: V1Pod, startup_check_interval: float = 30) -> None:
-        """Watch pod events and write to log."""
+        """
+        Watch pod events and write to log.
+
+        Best-effort: any error logs one warning and stops the watch, so a struggling API server
+        is not polled again for this pod.
+        """
         seen_events: set[str] = set()
         resource_version = None
         while not self.stop_watching_events:
-            async for event in self._hook.watch_pod_events(
-                name=pod.metadata.name,
-                namespace=pod.metadata.namespace,
-                resource_version=resource_version,
-                timeout_seconds=startup_check_interval,
-            ):
-                if event:
-                    log_pod_event(self, event, seen_events)
-                    resource_version = event.metadata.resource_version
+            try:
+                async for event in self._hook.watch_pod_events(
+                    name=pod.metadata.name,
+                    namespace=pod.metadata.namespace,
+                    resource_version=resource_version,
+                    timeout_seconds=startup_check_interval,
+                ):
+                    if event:
+                        log_pod_event(self, event, seen_events)
+                        resource_version = event.metadata.resource_version
+            except Exception as e:
+                self.log.warning("Stopped watching events of pod %s: %s", pod.metadata.name, e, exc_info=True)
+                return
 
     async def await_pod_start(
         self, pod: V1Pod, schedule_timeout: int = 120, startup_timeout: int = 120, check_interval: float = 1
@@ -1270,3 +1319,63 @@ class AsyncPodManager(LoggingMixin):
                 else:
                     level = _parse_log_level(message_to_log)
                     self.log.log(level, "[%s] %s", container_name, message_to_log)
+
+    def get_init_container_names(self, pod: V1Pod) -> list[str]:
+        """
+        Return init container names from the pod spec.
+
+        :meta private:
+        """
+        return [container_spec.name for container_spec in pod.spec.init_containers or []]
+
+    async def fetch_requested_init_container_logs(
+        self,
+        pod: V1Pod,
+        init_containers: Iterable[str] | str | Literal[True] | None,
+        poll_interval: float = 1,
+    ) -> None:
+        """
+        Stream logs for the requested init containers, one at a time, until each completes.
+
+        Init containers run sequentially before the base container starts, so they are
+        processed in ``spec.initContainers`` order, mirroring the sync ``PodManager``'s
+        ``fetch_requested_init_container_logs``.
+
+        :meta private:
+        """
+        all_containers = self.get_init_container_names(pod)
+        containers_to_log = reconcile_requested_log_containers(
+            self.log, init_containers, all_containers, pod.metadata.name
+        )
+        containers_to_log = sorted(containers_to_log, key=lambda cn: all_containers.index(cn))
+        for container_name in containers_to_log:
+            await self._await_init_container_start(pod, container_name)
+            await self._stream_init_container_logs_until_completion(pod, container_name, poll_interval)
+
+    async def _await_init_container_start(self, pod: V1Pod, container_name: str) -> None:
+        while True:
+            remote_pod = await self.read_pod(pod)
+            if (
+                remote_pod.status is not None
+                and remote_pod.status.phase != PodPhase.PENDING
+                and get_container_status(remote_pod, container_name) is not None
+                and not container_is_wait(remote_pod, container_name)
+            ):
+                return
+            await asyncio.sleep(1)
+
+    async def _stream_init_container_logs_until_completion(
+        self, pod: V1Pod, container_name: str, poll_interval: float
+    ) -> None:
+        since_time = None
+        while True:
+            remote_pod = await self.read_pod(pod)
+            since_time = await self.fetch_container_logs_before_current_sec(
+                remote_pod, container_name=container_name, since_time=since_time
+            )
+            # container_is_terminated() only inspects pod.status.container_statuses, which
+            # never includes init containers; get_container_status() checks both.
+            container_status = get_container_status(remote_pod, container_name)
+            if container_status is not None and container_status.state.terminated is not None:
+                return
+            await asyncio.sleep(poll_interval)

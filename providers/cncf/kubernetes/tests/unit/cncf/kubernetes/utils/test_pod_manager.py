@@ -17,7 +17,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta, timezone as dt_timezone
+from datetime import UTC, datetime, timedelta
 from json.decoder import JSONDecodeError
 from typing import TYPE_CHECKING, cast
 from unittest import mock
@@ -26,12 +26,15 @@ from unittest.mock import MagicMock, PropertyMock, patch
 import pendulum
 import pytest
 import time_machine
+from kubernetes.client import CoreV1Event, CoreV1EventList, V1ObjectMeta, V1ObjectReference, V1Pod
 from kubernetes.client.rest import ApiException
 from urllib3.exceptions import HTTPError as BaseHTTPError
 
 from airflow.providers.cncf.kubernetes.exceptions import KubernetesApiError
+from airflow.providers.cncf.kubernetes.hooks.kubernetes import AsyncKubernetesHook
 from airflow.providers.cncf.kubernetes.utils.pod_manager import (
     AsyncPodManager,
+    PodCommandException,
     PodLogsConsumer,
     PodManager,
     PodPhase,
@@ -47,6 +50,16 @@ from unit.cncf.kubernetes.test_callbacks import MockKubernetesPodOperatorCallbac
 
 if TYPE_CHECKING:
     from pendulum import DateTime
+
+POD_MANAGER_MODULE = "airflow.providers.cncf.kubernetes.utils.pod_manager"
+
+
+def _build_event_list() -> CoreV1EventList:
+    event = CoreV1Event(
+        involved_object=V1ObjectReference(),
+        metadata=V1ObjectMeta(uid="event-uid", resource_version="1"),
+    )
+    return CoreV1EventList(items=[event])
 
 
 @pytest.fixture
@@ -465,6 +478,32 @@ class TestPodManager:
             resource_version=None,
             resource_version_match=None,
         )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("read_result", "error"),
+        [
+            pytest.param(ApiException(status=504), str(ApiException(status=504)), id="reading-events"),
+            pytest.param(_build_event_list(), "bad event", id="logging-an-event"),
+        ],
+    )
+    @mock.patch(f"{POD_MANAGER_MODULE}.log_pod_event", autospec=True, side_effect=ValueError("bad event"))
+    @mock.patch.object(PodManager, "read_pod_events", autospec=True)
+    async def test_watch_pod_events_stops_on_error(
+        self, mock_read, mock_log_event, read_result, error, caplog
+    ):
+        mock_read.side_effect = [read_result]
+
+        await self.pod_manager.watch_pod_events(
+            V1Pod(metadata=V1ObjectMeta(name="test-pod")), check_interval=1
+        )
+
+        mock_read.assert_called_once()
+        assert (
+            mock.ANY,
+            logging.WARNING,
+            f"Stopped watching events of pod test-pod: {error}",
+        ) in caplog.record_tuples
 
     @pytest.mark.asyncio
     @mock.patch("asyncio.sleep", new_callable=mock.AsyncMock)
@@ -1131,7 +1170,7 @@ class TestPodManager:
     def test_fetch_container_with_valid_since_time(self, logs_available, container_running):
         """Test that since_seconds is calculated correctly when since_time is a valid datetime."""
         mock_pod = MagicMock()
-        since_time = datetime(2026, 1, 1, 0, 0, 0, tzinfo=dt_timezone.utc) - timedelta(seconds=30)
+        since_time = datetime(2026, 1, 1, 0, 0, 0, tzinfo=UTC) - timedelta(seconds=30)
         logs_available.return_value = True
         container_running.return_value = False
         self.mock_kube_client.read_namespaced_pod_log.return_value = mock.MagicMock(
@@ -1231,6 +1270,46 @@ class TestPodManager:
         "airflow.providers.cncf.kubernetes.utils.pod_manager.PodManager.container_is_running",
         return_value=True,
     )
+    def test_extract_xcom_returns_result_when_sidecar_kill_fails(
+        self, mock_container_is_running, mock_exec_xcom_kill, mock_kubernetes_stream
+    ):
+        """A failure to kill the sidecar must not discard the XCom value already read."""
+        xcom_json = """{"a": "true"}"""
+        mock_client = MagicMock()
+        mock_client.peek_stderr.return_value = ""
+        mock_client.read_all.return_value = xcom_json
+        mock_kubernetes_stream.return_value = mock_client
+        mock_exec_xcom_kill.side_effect = PodCommandException("Command failed with stderr: Permission denied")
+        ret = self.pod_manager.extract_xcom(pod=MagicMock())
+        assert ret == xcom_json
+        assert mock_exec_xcom_kill.call_count == 1
+
+    @mock.patch("airflow.providers.cncf.kubernetes.utils.pod_manager.kubernetes_stream")
+    @mock.patch("airflow.providers.cncf.kubernetes.utils.pod_manager.PodManager.extract_xcom_kill")
+    @mock.patch(
+        "airflow.providers.cncf.kubernetes.utils.pod_manager.PodManager.container_is_running",
+        return_value=True,
+    )
+    def test_extract_xcom_reraises_kill_failure_when_not_ignored(
+        self, mock_container_is_running, mock_exec_xcom_kill, mock_kubernetes_stream
+    ):
+        """With ignore_kill_failure=False the kill failure still propagates to the caller."""
+        xcom_json = """{"a": "true"}"""
+        mock_client = MagicMock()
+        mock_client.peek_stderr.return_value = ""
+        mock_client.read_all.return_value = xcom_json
+        mock_kubernetes_stream.return_value = mock_client
+        mock_exec_xcom_kill.side_effect = PodCommandException("Command failed with stderr: Permission denied")
+        with pytest.raises(PodCommandException, match="Permission denied"):
+            self.pod_manager.extract_xcom(pod=MagicMock(), ignore_kill_failure=False)
+        assert mock_exec_xcom_kill.call_count == 1
+
+    @mock.patch("airflow.providers.cncf.kubernetes.utils.pod_manager.kubernetes_stream")
+    @mock.patch("airflow.providers.cncf.kubernetes.utils.pod_manager.PodManager.extract_xcom_kill")
+    @mock.patch(
+        "airflow.providers.cncf.kubernetes.utils.pod_manager.PodManager.container_is_running",
+        return_value=True,
+    )
     def test_extract_xcom_failure(
         self, mock_container_is_running, mock_exec_xcom_kill, mock_kubernetes_stream
     ):
@@ -1301,8 +1380,8 @@ class TestPodManager:
         mock_pod = MagicMock()
         mock_container_is_running.return_value = False
         mock_container_is_terminated.return_value = False
-        with pytest.raises(AirflowException):
-            self.pod_manager.await_xcom_sidecar_container_start(pod=mock_pod, timeout=10, log_interval=5)
+        with pytest.raises(AirflowException), mock.patch("time.sleep"):
+            self.pod_manager.await_xcom_sidecar_container_start(pod=mock_pod, timeout=0, log_interval=5)
         mock_container_is_running.assert_any_call(mock_pod, "airflow-xcom-sidecar")
         mock_container_is_terminated.assert_any_call(mock_pod, "airflow-xcom-sidecar")
 
@@ -1488,6 +1567,37 @@ class TestAsyncPodManager:
 
         # Verify hook was called
         self.mock_async_hook.watch_pod_events.assert_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("watched", "error"),
+        [
+            pytest.param(ApiException(status=504), str(ApiException(status=504)), id="watching-events"),
+            pytest.param(_build_event_list().items[0], "bad event", id="logging-an-event"),
+        ],
+    )
+    @mock.patch(f"{POD_MANAGER_MODULE}.log_pod_event", autospec=True, side_effect=ValueError("bad event"))
+    async def test_watch_pod_events_stops_on_error(self, mock_log_event, watched, error, caplog):
+        async def event_stream(*_, **__):
+            if isinstance(watched, Exception):
+                raise watched
+            yield watched
+
+        hook = mock.create_autospec(AsyncKubernetesHook, instance=True)
+        hook.watch_pod_events.side_effect = event_stream
+        self.async_pod_manager._hook = hook
+
+        await self.async_pod_manager.watch_pod_events(
+            V1Pod(metadata=V1ObjectMeta(name="test-pod", namespace="test-namespace")),
+            startup_check_interval=30,
+        )
+
+        hook.watch_pod_events.assert_called_once()
+        assert (
+            mock.ANY,
+            logging.WARNING,
+            f"Stopped watching events of pod test-pod: {error}",
+        ) in caplog.record_tuples
 
     @pytest.mark.asyncio
     async def test_watch_pod_events_tracks_resource_version(self):
@@ -1807,6 +1917,134 @@ class TestAsyncPodManager:
         mock_to_thread.assert_awaited_once_with(
             self.async_pod_manager._emit_container_logs, log_lines, now, container_name
         )
+
+    def test_get_init_container_names(self):
+        pod = mock.MagicMock()
+        init_a, init_b = mock.MagicMock(), mock.MagicMock()
+        init_a.name = "init-a"
+        init_b.name = "init-b"
+        pod.spec.init_containers = [init_a, init_b]
+
+        assert self.async_pod_manager.get_init_container_names(pod) == ["init-a", "init-b"]
+
+    def test_get_init_container_names_when_pod_has_no_init_containers(self):
+        pod = mock.MagicMock()
+        pod.spec.init_containers = None
+
+        assert self.async_pod_manager.get_init_container_names(pod) == []
+
+    @pytest.mark.asyncio
+    async def test_fetch_requested_init_container_logs_processes_containers_in_spec_order(self):
+        """Init containers run sequentially, so their logs must be streamed one at a time
+        in ``spec.initContainers`` order -- mirroring the sync ``PodManager``'s behaviour."""
+        pod = mock.MagicMock()
+        init_a, init_b = mock.MagicMock(), mock.MagicMock()
+        init_a.name = "init-a"
+        init_b.name = "init-b"
+        pod.spec.init_containers = [init_a, init_b]
+
+        calls = []
+
+        async def fake_await_start(_pod, container_name):
+            calls.append(("start", container_name))
+
+        async def fake_stream(_pod, container_name, _poll_interval):
+            calls.append(("stream", container_name))
+
+        with (
+            mock.patch.object(
+                self.async_pod_manager, "_await_init_container_start", side_effect=fake_await_start
+            ),
+            mock.patch.object(
+                self.async_pod_manager,
+                "_stream_init_container_logs_until_completion",
+                side_effect=fake_stream,
+            ),
+        ):
+            await self.async_pod_manager.fetch_requested_init_container_logs(pod, init_containers=True)
+
+        assert calls == [("start", "init-a"), ("stream", "init-a"), ("start", "init-b"), ("stream", "init-b")]
+
+    @pytest.mark.asyncio
+    async def test_fetch_requested_init_container_logs_only_requested_container(self):
+        pod = mock.MagicMock()
+        init_a, init_b = mock.MagicMock(), mock.MagicMock()
+        init_a.name = "init-a"
+        init_b.name = "init-b"
+        pod.spec.init_containers = [init_a, init_b]
+
+        calls = []
+
+        async def fake_await_start(_pod, container_name):
+            calls.append(container_name)
+
+        with (
+            mock.patch.object(
+                self.async_pod_manager, "_await_init_container_start", side_effect=fake_await_start
+            ),
+            mock.patch.object(
+                self.async_pod_manager,
+                "_stream_init_container_logs_until_completion",
+                new=mock.AsyncMock(),
+            ),
+        ):
+            await self.async_pod_manager.fetch_requested_init_container_logs(pod, init_containers="init-b")
+
+        assert calls == ["init-b"]
+
+    @pytest.mark.asyncio
+    async def test_await_init_container_start_waits_until_pod_leaves_pending(self):
+        pending_pod = mock.MagicMock()
+        pending_pod.status.phase = PodPhase.PENDING
+
+        started_status = mock.MagicMock()
+        started_status.name = "init-a"
+        started_status.state.waiting = None
+        started_pod = mock.MagicMock()
+        started_pod.status.phase = PodPhase.RUNNING
+        started_pod.status.container_statuses = None
+        started_pod.status.init_container_statuses = [started_status]
+
+        self.mock_async_hook.get_pod = mock.AsyncMock(side_effect=[pending_pod, started_pod])
+
+        with mock.patch(
+            "airflow.providers.cncf.kubernetes.utils.pod_manager.asyncio.sleep", new=mock.AsyncMock()
+        ):
+            await self.async_pod_manager._await_init_container_start(mock.MagicMock(), "init-a")
+
+        assert self.mock_async_hook.get_pod.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_stream_init_container_logs_until_completion_polls_until_terminated(self):
+        """Regression guard: init container completion must be detected via
+        ``status.init_container_statuses``, not ``status.container_statuses`` (which never
+        contains init containers), or this loops until the mocked ``get_pod`` side effects
+        are exhausted and raises ``StopAsyncIteration``."""
+        running_status = mock.MagicMock()
+        running_status.name = "init-a"
+        running_status.state.terminated = None
+        running_pod = mock.MagicMock()
+        running_pod.status.container_statuses = None
+        running_pod.status.init_container_statuses = [running_status]
+
+        terminated_status = mock.MagicMock()
+        terminated_status.name = "init-a"
+        terminated_pod = mock.MagicMock()
+        terminated_pod.status.container_statuses = None
+        terminated_pod.status.init_container_statuses = [terminated_status]
+
+        self.mock_async_hook.get_pod = mock.AsyncMock(side_effect=[running_pod, terminated_pod])
+        self.mock_async_hook.read_logs = mock.AsyncMock(return_value=[])
+
+        with mock.patch(
+            "airflow.providers.cncf.kubernetes.utils.pod_manager.asyncio.sleep", new=mock.AsyncMock()
+        ):
+            await self.async_pod_manager._stream_init_container_logs_until_completion(
+                mock.MagicMock(), "init-a", poll_interval=0.01
+            )
+
+        assert self.mock_async_hook.get_pod.await_count == 2
+        assert self.mock_async_hook.read_logs.await_count == 2
 
 
 class TestPodLogsConsumer:

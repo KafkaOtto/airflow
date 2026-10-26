@@ -61,6 +61,9 @@ class GKEStartPodTrigger(KubernetesPodTrigger):
     :param use_dns_endpoint: Use the DNS address as the endpoint. This needs to set to True for the Sovereign
         Cloud from Google.
     :param get_logs: get the stdout of the container as logs of the tasks.
+    :param init_container_logs: list of init containers whose logs should be streamed once
+        the pod leaves the ``Pending`` phase. Set to ``True`` to fetch logs for all init
+        containers. If ``None`` or empty, init container logs are not fetched.
     :param startup_timeout: timeout in seconds to start up the pod.
     :param base_container_name: The name of the base container in the pod. This container's logs
         will appear as part of this task's logs if get_logs is True. Defaults to None. If None,
@@ -147,16 +150,18 @@ class GKEStartPodTrigger(KubernetesPodTrigger):
                 "in_cluster": self.in_cluster,
                 "use_dns_endpoint": self.use_dns_endpoint,
                 "get_logs": self.get_logs,
+                "init_container_logs": self.init_container_logs,
                 "startup_timeout": self.startup_timeout,
                 "schedule_timeout": self.schedule_timeout,
                 "trigger_start_time": self.trigger_start_time,
                 "base_container_name": self.base_container_name,
-                "should_delete_pod": self.should_delete_pod,
+                "should_delete_pod": None,
                 "on_finish_action": self.on_finish_action.value,
                 "gcp_conn_id": self.gcp_conn_id,
                 "impersonation_chain": self.impersonation_chain,
                 "logging_interval": self.logging_interval,
                 "last_log_time": self.last_log_time,
+                "trigger_kwargs": self.trigger_kwargs,
             },
         )
 
